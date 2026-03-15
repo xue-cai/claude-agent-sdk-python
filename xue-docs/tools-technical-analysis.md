@@ -9,6 +9,10 @@
 5. [SDK MCP Servers (In-Process)](#3-sdk-mcp-servers-in-process)
 6. [How SDK MCP Tools Actually Work](#how-sdk-mcp-tools-actually-work)
 7. [Authentication & Auth Handling](#authentication--auth-handling)
+   - [Environment-Based Auth](#environment-based-auth)
+   - [MCP Server Auth](#mcp-server-auth)
+   - [User Identity](#user-identity)
+   - [Cloud Deployment & Credential Security](#cloud-deployment--credential-security)
 8. [Tool Permission Callbacks](#tool-permission-callbacks)
 9. [Hook System](#hook-system)
 10. [Custom Agents (Skills)](#custom-agents-skills)
@@ -412,6 +416,160 @@ self._process = await anyio.open_process(
     user=self._options.user,  # OS-level user for the subprocess
 )
 ```
+
+### Cloud Deployment & Credential Security
+
+When deploying a Claude SDK agent in the cloud (e.g., behind a web API serving multiple users), credentials must be handled carefully. There are three main mechanisms for passing secrets, and two deployment patterns for per-user credential isolation.
+
+#### Three Credential Passing Mechanisms
+
+**1. `ClaudeAgentOptions.env` — Environment variables for API keys & shared secrets**
+
+Environment variables are injected in-memory into the Claude CLI subprocess. They never touch disk — they flow directly through the OS process environment:
+
+```python
+options = ClaudeAgentOptions(
+    env={
+        "ANTHROPIC_API_KEY": "sk-ant-...",       # Claude API key
+        "MY_SERVICE_API_KEY": "service-secret",   # Your own service keys
+    }
+)
+```
+
+In `subprocess_cli.py` (lines 345-358), these are merged with `os.environ` and passed directly to `anyio.open_process()` — they are **not** serialized to disk or logged.
+
+**2. `headers` on remote MCP servers — Bearer tokens & OAuth tokens**
+
+Both `McpHttpServerConfig` and `McpSSEServerConfig` (defined in `types.py` lines 478-491) accept a `headers` dict for auth. This is the primary mechanism for passing per-user OAuth tokens to remote tool servers:
+
+```python
+options = ClaudeAgentOptions(
+    mcp_servers={
+        "calendar-api": {
+            "type": "http",
+            "url": "https://calendar.example.com/mcp",
+            "headers": {
+                "Authorization": "Bearer <user-oauth-token>"
+            }
+        }
+    }
+)
+```
+
+These headers are serialized to a temporary JSON file and passed via `--mcp-config` to the CLI (see `subprocess_cli.py` lines 240-265).
+
+**3. `env` on stdio MCP servers — Tokens for local servers**
+
+For local MCP servers spawned as subprocesses, you can inject tokens via environment variables:
+
+```python
+options = ClaudeAgentOptions(
+    mcp_servers={
+        "local-calendar": {
+            "type": "stdio",
+            "command": "python",
+            "args": ["-m", "my_calendar_server"],
+            "env": {"OAUTH_TOKEN": "<user-oauth-token>"}
+        }
+    }
+)
+```
+
+#### Per-User OAuth Tokens in Multi-Tenant Deployments
+
+**Critical design constraint:** `ClaudeAgentOptions` is set at initialization and is **immutable** for the lifetime of a `ClaudeSDKClient` session. There is no API to update credentials on a running session. This leads to two deployment patterns:
+
+**Pattern A: `query()` function — Best for per-request credential isolation**
+
+The `query()` function (in `query.py`) creates a **fresh subprocess per call**. Each user gets their own isolated process with their own credentials. This is ideal for stateless request/response flows:
+
+```python
+from claude_agent_sdk import query, ClaudeAgentOptions
+
+async def handle_user_request(user_id: str, user_prompt: str):
+    # 1. Fetch user's OAuth token from your secure store
+    oauth_token = await get_user_oauth_token(user_id)
+
+    # 2. Build per-user options with scoped credentials
+    options = ClaudeAgentOptions(
+        mcp_servers={
+            "user-calendar": {
+                "type": "http",
+                "url": "https://calendar.example.com/mcp",
+                "headers": {"Authorization": f"Bearer {oauth_token}"}
+            }
+        },
+        env={
+            "ANTHROPIC_API_KEY": secrets_manager.get("ANTHROPIC_API_KEY"),
+        }
+    )
+
+    # 3. Each call spawns an isolated subprocess — tokens never mix
+    results = []
+    async for message in query(prompt=user_prompt, options=options):
+        results.append(message)
+    return results
+```
+
+**Pattern B: Per-user `ClaudeSDKClient` — Best for multi-turn conversations**
+
+If a user has a multi-turn conversation (e.g., "What's on my calendar?" → "Move the 3pm to 4pm"), create a dedicated client instance for that user's session:
+
+```python
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+async def handle_user_session(user_id: str):
+    oauth_token = await get_user_oauth_token(user_id)
+
+    options = ClaudeAgentOptions(
+        mcp_servers={
+            "user-calendar": {
+                "type": "http",
+                "url": "https://calendar.example.com/mcp",
+                "headers": {"Authorization": f"Bearer {oauth_token}"}
+            }
+        }
+    )
+
+    # One client per user session — all queries share the same token
+    async with ClaudeSDKClient(options=options) as client:
+        async for msg in client.query("What's on my calendar today?"):
+            yield msg
+        async for msg in client.query("Move the 3pm meeting to 4pm"):
+            yield msg
+```
+
+**Token refresh caveat:** If the OAuth token expires mid-session, you must create a **new** `ClaudeSDKClient` with a refreshed token — there is no way to update credentials on a running session.
+
+#### Credential Flow Summary
+
+| Credential Type | Mechanism | Scope | Where it lives in code |
+|---|---|---|---|
+| Anthropic API key | `options.env` | Subprocess environment | `subprocess_cli.py` lines 345-358 |
+| Remote MCP OAuth token | `mcp_servers[name].headers` | HTTP headers per request | `types.py` lines 486-491 |
+| Local MCP token | `mcp_servers[name].env` | Subprocess environment | `types.py` lines 469-475 |
+| OS-level user identity | `options.user` | Process owner | `subprocess_cli.py` line 375 |
+
+#### Multi-Tenant Pattern Comparison
+
+| Scenario | `query()` (Pattern A) | `ClaudeSDKClient` (Pattern B) |
+|---|---|---|
+| Per-request OAuth tokens | ✅ Fresh subprocess per call | ❌ Must recreate client |
+| Multi-turn conversation | ❌ No conversation memory | ✅ Maintains session state |
+| Token refresh mid-session | ✅ Automatic (new subprocess) | ❌ Requires new client |
+| Resource efficiency | Lower (new process each time) | Higher (reuses process) |
+| Credential isolation | ✅ Complete isolation | ✅ One client per user |
+
+#### Security Best Practices for Cloud Deployment
+
+| Practice | How |
+|---|---|
+| **Never hardcode tokens** | Fetch from a secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.) at request time |
+| **Token isolation** | Use `query()` or per-user `ClaudeSDKClient` — never share a client across users |
+| **Token rotation** | For long sessions, catch auth errors and recreate the client with a refreshed token |
+| **Least privilege** | Only pass the headers/env vars the MCP server actually needs |
+| **Audit trail** | The SDK passes credentials in-memory to the subprocess; they don't hit disk unless you log them |
+| **OS-level isolation** | Use `options.user` to run each user's subprocess under a different OS user if needed |
 
 ---
 
@@ -893,8 +1051,9 @@ ToolResultBlock(tool_use_id: str, content: str | list | None, is_error: bool | N
 
 1. **No direct API calls** — The SDK communicates exclusively with the Claude Code CLI subprocess.
 2. **SDK MCP servers are bridges** — Tools defined with `@tool` are routed through a manual JSONRPC bridge in `Query._handle_sdk_mcp_request()`.
-3. **Auth is delegated** — All authentication is handled by the Claude Code CLI via environment variables.
-4. **Everything is streaming** — Internally, the SDK always uses `--input-format stream-json` for bidirectional control.
-5. **Hooks use callback IDs** — Python functions are registered by ID during initialization, and the CLI invokes them by ID.
-6. **Permission callbacks are interceptors** — `can_use_tool` intercepts every tool call and can allow, deny, or modify the input.
-7. **Agents are sent via initialize** — Custom agent definitions (skills) bypass CLI argument limits by being sent over the control protocol.
+3. **Auth is delegated** — All authentication is handled by the Claude Code CLI via environment variables, MCP headers, and MCP server env vars.
+4. **Credentials are immutable per session** — Options (including tokens) are set at initialization. For per-user OAuth, use `query()` for isolation or per-user `ClaudeSDKClient` for multi-turn sessions.
+5. **Everything is streaming** — Internally, the SDK always uses `--input-format stream-json` for bidirectional control.
+6. **Hooks use callback IDs** — Python functions are registered by ID during initialization, and the CLI invokes them by ID.
+7. **Permission callbacks are interceptors** — `can_use_tool` intercepts every tool call and can allow, deny, or modify the input.
+8. **Agents are sent via initialize** — Custom agent definitions (skills) bypass CLI argument limits by being sent over the control protocol.
