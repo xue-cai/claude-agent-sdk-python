@@ -14,7 +14,7 @@
 
 ## Question
 
-> Does agents built with the Claude Agent SDK use a standard protocol between users and clients? For example, I use the SDK to build a travel agent that can research travel plans, book flights and hotels, and create Google Calendar events. I then host this agent to run in the cloud and expose it as a webapp to other users. Other users can use it for their own travels. What will the protocol between the agent and the users using it?
+> Do agents built with the Claude Agent SDK use a standard protocol between users and clients? For example, I use the SDK to build a travel agent that can research travel plans, book flights and hotels, and create Google Calendar events. I then host this agent to run in the cloud and expose it as a webapp to other users. Other users can use it for their own travels. What is the protocol between the agent and the users using it?
 
 ---
 
